@@ -70,6 +70,7 @@ The harness decides how a C2A event becomes model-visible context:
 
 - Immediate prompt injection.
 - Buffered prompt injection after a compose window.
+- Lightweight notification with metadata only.
 - Tool-only mailbox access.
 - Periodic digest.
 - Silent persistence with no model exposure.
@@ -205,7 +206,9 @@ Required fields:
 
 - `eventId`: stable source event identifier.
 - `conversation.kind`: `dm`, `channel`, `thread`, `system`, or `tool`.
-- `content`: typed message parts.
+- `content`: typed message parts when the body is exposed to the harness. For a
+  `notify` knock, the host withholds raw message content until the agent pulls it
+  through a chat tool.
 - `target.directedness`: whether the event is aimed at this agent (`to_me`,
   `to_my_role`, `to_other`, `ambient`).
 - `attention.policy`: response rule.
@@ -244,7 +247,7 @@ streams; without that binding, directedness cannot be computed.
 | Directedness | Meaning | Default injection |
 | --- | --- | --- |
 | `to_me` | DM to this session, or a resolved direct @mention of this agent | `buffered` (full content) |
-| `to_my_role` | mention of a role or group this agent belongs to | `notify`, then claim |
+| `to_my_role` | mention of this agent's role/group, or a thread/stream this agent owns or participates in | `notify`, then claim |
 | `to_other` | explicitly addressed to another agent or user | `tool_mailbox` or `silent` |
 | `ambient` | not addressed to anyone in particular | `tool_mailbox` |
 
@@ -707,8 +710,9 @@ The host and harness SHOULD:
 
 The first useful implementation only needs these:
 
-1. Stable event envelope with `eventId`, `conversation`, `content`,
-   `target.directedness`, `attention.policy`, and `injection.mode`.
+1. Stable event envelope with `eventId`, `conversation`, `target.directedness`,
+   `attention.policy`, and `injection.mode`, plus either message `content` or a
+   `notify` knock.
 2. Default rule by directedness: `to_me` is injected, `to_my_role` gets a
    `notify` knock, ambient channels are tool-only.
 3. Response policies: `must_respond`, `may_respond`, `ack_only`,
