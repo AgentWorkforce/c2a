@@ -103,6 +103,7 @@ The host and harness SHOULD begin with an `initialize` exchange:
       "injection": {
         "immediate": true,
         "buffered": true,
+        "notify": true,
         "tool_mailbox": true,
         "digest": true,
         "interrupt": false
@@ -111,6 +112,7 @@ The host and harness SHOULD begin with an `initialize` exchange:
         "readThread": true,
         "sendMessage": true,
         "react": true,
+        "reactionSignals": true,
         "claim": true,
         "defer": true,
         "resolve": true
@@ -167,7 +169,8 @@ Every inbound chat event delivered to a harness SHOULD use this shape:
     },
     "target": {
       "mentions": ["agent:lead"],
-      "recipient": "agent:lead"
+      "recipient": "agent:lead",
+      "directedness": "to_me"
     },
     "content": [
       {
@@ -203,39 +206,82 @@ Required fields:
 - `eventId`: stable source event identifier.
 - `conversation.kind`: `dm`, `channel`, `thread`, `system`, or `tool`.
 - `content`: typed message parts.
+- `target.directedness`: whether the event is aimed at this agent (`to_me`,
+  `to_my_role`, `to_other`, `ambient`).
 - `attention.policy`: response rule.
 - `injection.mode`: model exposure rule.
 - `reliability.idempotencyKey`: stable key for dedupe.
 
-## Attention Policies
+## The Attention Model
 
-The host computes a policy before the event reaches the model.
+C2A separates three questions that prose-level "should the agent reply?"
+discussions usually tangle together. They are orthogonal, and every delivered
+event answers all three:
+
+1. **Directedness** — is this event aimed at *this* agent? (`target.directedness`)
+2. **Response policy** — is the agent obligated, permitted, or forbidden to
+   reply? (`attention.policy`)
+3. **Injection mode** — does the agent see the full content now, a lightweight
+   knock it can pull later, or nothing? (`injection.mode`)
+
+Decoupling them is deliberate. A `must_respond` event can be delivered as a
+`notify` knock ("you must answer this — pull the body when you are ready"), and a
+`may_respond` event can be fully injected. The host computes a default for each
+axis, and directedness is the primary input to the other two.
+
+The cost model is the point. Full injection, plus a model turn, plus a composed
+reply, is the expensive path. C2A exists to reserve that path for events that are
+both directed at the agent and worth a turn, and to discharge everything else
+with a knock the agent can ignore or a single reaction everyone can see.
+
+### Directedness
+
+`target.directedness` is computed by the host from mention resolution, recipient,
+and stream/task ownership (see Coordination And Claims). Resolving "this agent"
+requires the host to bind agent sessions to platform identities and owned
+streams; without that binding, directedness cannot be computed.
+
+| Directedness | Meaning | Default injection |
+| --- | --- | --- |
+| `to_me` | DM to this session, or a resolved direct @mention of this agent | `buffered` (full content) |
+| `to_my_role` | mention of a role or group this agent belongs to | `notify`, then claim |
+| `to_other` | explicitly addressed to another agent or user | `tool_mailbox` or `silent` |
+| `ambient` | not addressed to anyone in particular | `silent` |
+
+### Response Policy
+
+The host attaches one response policy to every event.
 
 | Policy | Meaning |
 | --- | --- |
-| `must_respond` | The agent should answer or explicitly defer through a tool. |
+| `must_respond` | The agent should answer or explicitly defer through a tool or reaction. |
 | `may_respond` | The agent may answer if it owns the work or can materially help. |
-| `ack_only` | The agent may react, mark seen, or send a short receipt, but should not produce a substantive reply. |
+| `ack_only` | The agent may react or send a short receipt, but should not produce a substantive reply. |
 | `must_not_respond` | The agent must not send chat in response to this event. |
 
-Default policy matrix:
+### Default Matrix
 
-| Event | Default policy | Default injection |
-| --- | --- | --- |
-| DM to this agent/session | `must_respond` | `buffered` |
-| DM containing only thanks/acknowledgement | `ack_only` | `buffered` or `silent` |
-| Channel message with no mention | `must_not_respond` | `tool_mailbox` |
-| Channel direct mention of this agent | `must_respond` | `buffered` with thread context |
-| Channel mention of a role or group | `may_respond` after claim | `tool_mailbox` or `buffered` for selected responder |
-| Thread reply where agent is participant | `may_respond` | `buffered` |
-| Thread reply asking agent a direct question | `must_respond` | `buffered` |
-| Message from another agent with no question/task | `must_not_respond` | `tool_mailbox` |
-| Assignment, approval request, or blocker | `must_respond` | `immediate` or `buffered` |
-| Logs, progress, status broadcasts | `must_not_respond` | `digest` or `silent` |
+Directedness sets the injection default; the event's intent sets the policy. The
+two compose:
 
-An agent MUST NOT answer a message merely because it was visible. It should only
-answer when the response policy permits it and the message creates a clear
-obligation or opportunity.
+| Event | Directedness | Policy | Injection |
+| --- | --- | --- | --- |
+| DM to this session | `to_me` | `must_respond` | `buffered` |
+| DM with only thanks/acknowledgement | `to_me` | `ack_only` | `notify` or `silent` |
+| Direct @mention of this agent | `to_me` | `must_respond` | `buffered` + thread context |
+| Assignment, approval request, or blocker for this agent | `to_me` | `must_respond` | `immediate` or `buffered` |
+| Thread reply asking this agent a direct question | `to_me` | `must_respond` | `buffered` |
+| Role or group mention | `to_my_role` | `may_respond` after claim | `notify`, then `buffered` for the claimant |
+| Thread reply where this agent participates | `to_my_role` | `may_respond` | `notify` |
+| Message addressed to another agent | `to_other` | `must_not_respond` | `tool_mailbox` |
+| Message from another agent with no question/task | `to_other` | `must_not_respond` | `tool_mailbox` |
+| Channel message with no mention | `ambient` | `must_not_respond` | `tool_mailbox` |
+| Logs, progress, status broadcasts | `ambient` | `must_not_respond` | `digest` or `silent` |
+
+An agent MUST NOT answer a message merely because it was visible. It should answer
+only when the response policy permits it and the message creates a clear
+obligation or opportunity. Visibility is not directedness; directedness is not
+obligation.
 
 ## Injection Modes
 
@@ -268,6 +314,35 @@ pieces
 like this
 the agent should wait
 ```
+
+### `notify`
+
+Use when the agent should know an event exists without spending a model turn to
+read it. The harness injects an envelope — a *knock* — carrying who, where,
+directedness, policy, priority, and a host-generated one-line topic, but **not**
+the message body. The agent decides whether to pull the content with
+`chat.read_thread` or `chat.list_events`.
+
+```json
+{
+  "injection": { "mode": "notify" },
+  "knock": {
+    "from": "agent:worker-3",
+    "where": "thread:deploy-migration",
+    "directedness": "to_my_role",
+    "policy": "may_respond",
+    "priority": "normal",
+    "topic": "question about the rollback step",
+    "pullWith": "chat.read_thread"
+  }
+}
+```
+
+`knock.topic` is a short host-generated summary, never raw untrusted content, and
+MUST follow the same trust boundaries as any injected text. `notify` is the
+default for role mentions and thread participation: the agent is told something is
+waiting and pulls it only if it is worth a turn. It is the rung between `buffered`
+(full content, unconditional) and `tool_mailbox` (nothing surfaced).
 
 ### `tool_mailbox`
 
@@ -340,6 +415,42 @@ An agent should not respond when:
 For `may_respond`, the agent should prefer no response unless a reply is useful.
 No response is a valid protocol outcome.
 
+## Outbound Posture
+
+The attention model is symmetric. An agent that floods others with direct
+mentions recreates exactly the noise C2A exists to prevent. When an agent emits
+chat, it MUST choose directedness and visibility as deliberately as the host does
+on inbound. The agent owns this choice; the host renders it as a mention, thread
+reply, channel post, or reaction.
+
+| Goal | Surface | Effect on recipients |
+| --- | --- | --- |
+| Get a specific agent to act | DM or direct @mention of that agent | `to_me` / `must_respond` for one recipient |
+| Offer work to a role or pool | role mention (`@backend-agents`) | `to_my_role` / `may_respond` after claim |
+| Add to a thread others own | post in thread, no mention | `to_my_role` / `may_respond`, delivered as `notify` |
+| Share context, no action wanted | channel post, no mention | `ambient` / `must_not_respond`, lands in mailboxes |
+| Acknowledge, accept, or decline | reaction signal | zero-turn disposition, no new turn for anyone |
+| Report status or progress | `notifications/progress`, not chat | digest or UI, never a `must_respond` |
+
+Rules for outbound:
+
+- **@mention only to create an obligation.** A direct mention makes the target
+  `must_respond`. Do not mention to share information; post ambiently instead.
+- **Prefer a reaction to a message** when a signal will do. "Got it", "on it",
+  "approved", and "not me" are reactions, not sentences.
+- **Address one responder, not the room.** To get something done, DM or mention a
+  single agent, or claim the work; do not broadcast a task to a channel and hope.
+- **Do not @mention to say thanks or acknowledge.** That is `ack_only`; use a
+  reaction.
+- **Route status to progress, not chat.** Logs and progress are
+  `notifications/progress` or digests, never directed messages.
+- **Respect claims.** If another agent has claimed an event, do not post a
+  competing reply; react or defer to them.
+
+An outbound message SHOULD carry the agent's intended directedness so the host can
+render it correctly and so downstream agents inherit an accurate inbound
+`target.directedness` without re-inferring it.
+
 ## Event Disposition
 
 Every delivered event should eventually receive one disposition in the host's
@@ -359,6 +470,54 @@ state machine:
 `ack_only` events SHOULD become `acknowledged` or `ignored`.
 `must_respond` events SHOULD become `responded`, `deferred`, `superseded`, or
 `failed`.
+
+## Reaction Signals
+
+A reaction is a typed, zero-turn disposition. It lets an agent discharge an event
+without a model turn and without a chat message, visibly to both humans and other
+agents. Reactions are the low-bandwidth surface of the disposition state machine.
+
+The protocol carries the **signal**, not the emoji. Emoji availability and meaning
+differ across platforms and teams, so `chat.react` takes a semantic `signal` and
+the host renders it to a platform reaction. Agents reason about signals; they
+never hardcode glyphs.
+
+| Signal | Default glyph | Meaning | Disposition |
+| --- | --- | --- | --- |
+| `seen` | 👀 | read, no commitment | `acknowledged` |
+| `agree` | 👍 | acknowledge or approve | `acknowledged` |
+| `working` | 🔧 | actively on it now | `claimed` |
+| `queued` | 🕐 | accepted, but behind higher-priority work; optional `eta` | `deferred` |
+| `claimed` | ✋ | this agent owns the event | `claimed` |
+| `done` | ✅ | resolved | `responded` |
+| `declined` | 🙅 | not this agent, or will not act | `ignored` |
+| `blocked` | 🚧 | cannot proceed, needs input | `deferred` |
+| `unclear` | ❓ | needs clarification | — |
+
+Default glyphs are a recommendation; a workspace MAY remap a signal to a different
+emoji. The mapping is exchanged during capability negotiation when
+`reactionSignals` is supported, so an agent never depends on a specific glyph.
+
+Example — accept a request but defer it behind current priorities. This is the
+common "I see this, I will get to it after what I am already doing" case, for the
+cost of one API call and zero tokens:
+
+```json
+{
+  "name": "chat.react",
+  "arguments": {
+    "inReplyTo": "evt_123",
+    "signal": "queued",
+    "eta": "after the deploy completes"
+  }
+}
+```
+
+Reactions are bidirectional. A reaction placed **on an agent's own message** is an
+inbound signal the agent SHOULD interpret: `agree` on a proposal means proceed,
+`declined` means revise, `done` means the work is already handled. The host SHOULD
+deliver inbound reactions as `notify` or `tool_mailbox` events, not as `buffered`
+turns, unless the reaction changes a `must_respond` obligation.
 
 ## Chat Tools
 
@@ -383,7 +542,7 @@ Recommended tools:
   },
   {
     "name": "chat.react",
-    "description": "Add a lightweight reaction or acknowledgement."
+    "description": "Send a typed reaction signal (seen, agree, working, queued, claimed, done, declined, blocked, unclear) as a zero-turn disposition. Carries a semantic signal, not an emoji."
   },
   {
     "name": "chat.claim",
@@ -406,6 +565,8 @@ Outbound sends MUST include:
 - `inReplyTo`: source event ID where applicable.
 - `idempotencyKey`: stable key reused across retries.
 - `visibility`: `dm`, `thread`, `channel`, or `ephemeral` where supported.
+- `directedness`: intended audience (`to_me`, `to_my_role`, `to_other`,
+  `ambient`) so recipients inherit a correct inbound policy.
 
 ## Coordination And Claims
 
@@ -542,18 +703,22 @@ The host and harness SHOULD:
 
 ## Minimal Viable C2A
 
-The first useful implementation only needs seven things:
+The first useful implementation only needs these:
 
 1. Stable event envelope with `eventId`, `conversation`, `content`,
-   `attention.policy`, and `injection.mode`.
-2. Default rule: DMs and direct mentions are injected; ambient channels are
-   tool-only.
+   `target.directedness`, `attention.policy`, and `injection.mode`.
+2. Default rule by directedness: `to_me` is injected, `to_my_role` gets a
+   `notify` knock, ambient channels are tool-only.
 3. Response policies: `must_respond`, `may_respond`, `ack_only`,
    `must_not_respond`.
-4. Buffered human-turn assembly for DMs and mentions.
-5. Idempotent outbound `chat.send_message`.
-6. Channel-event claiming to prevent multiple agents replying.
-7. Retry/dedup by event ID and idempotency key.
+4. The `notify` knock so agents can pull content instead of paying a model turn
+   per event.
+5. Buffered human-turn assembly for DMs and mentions.
+6. Reaction signals for zero-turn dispositions (at least `seen`, `queued`,
+   `done`).
+7. Idempotent outbound `chat.send_message` with deliberate directedness.
+8. Channel-event claiming to prevent multiple agents replying.
+9. Retry/dedup by event ID and idempotency key.
 
 ## Open Design Questions
 
@@ -566,6 +731,10 @@ The first useful implementation only needs seven things:
   first-claim wins?
 - How much thread history should be injected for a direct mention before the
   agent uses `chat.read_thread`?
+- How much should a `notify` knock reveal — recipient and priority only, or a
+  host-summarized `topic` — before it leaks content it was meant to withhold?
+- Should the reaction-signal vocabulary be fixed or workspace-extensible, and how
+  should an agent degrade when it receives an unknown signal?
 - What UI should represent `ack_only` and `must_not_respond` outcomes?
 - Should digests be per stream of work, per channel, or per lead agent?
 
