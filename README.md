@@ -246,7 +246,7 @@ streams; without that binding, directedness cannot be computed.
 | `to_me` | DM to this session, or a resolved direct @mention of this agent | `buffered` (full content) |
 | `to_my_role` | mention of a role or group this agent belongs to | `notify`, then claim |
 | `to_other` | explicitly addressed to another agent or user | `tool_mailbox` or `silent` |
-| `ambient` | not addressed to anyone in particular | `silent` |
+| `ambient` | not addressed to anyone in particular | `tool_mailbox` |
 
 ### Response Policy
 
@@ -373,6 +373,7 @@ event_id: evt_123
 conversation: dm C123
 thread: 1748890000.000100
 author: human:Will
+directedness: to_me
 response_policy: must_respond
 reason: direct_message
 reply_target: thread:1748890000.000100
@@ -458,7 +459,7 @@ state machine:
 
 | Disposition | Meaning |
 | --- | --- |
-| `responded` | The agent sent a substantive response. |
+| `responded` | The agent satisfied the event with a substantive response, completion signal, or resolving action. |
 | `acknowledged` | The agent reacted, marked seen, or sent a lightweight receipt. |
 | `deferred` | The agent accepted responsibility but needs more time or input. |
 | `claimed` | The agent owns the event but has not completed it yet. |
@@ -468,8 +469,9 @@ state machine:
 
 `must_not_respond` events SHOULD become `ignored` unless they are superseded.
 `ack_only` events SHOULD become `acknowledged` or `ignored`.
-`must_respond` events SHOULD become `responded`, `deferred`, `superseded`, or
-`failed`.
+`must_respond` events SHOULD become `responded`, `acknowledged`, `deferred`,
+`superseded`, or `failed`. Use `acknowledged` only when an acknowledgement or
+approval signal fully satisfies the requested action.
 
 ## Reaction Signals
 
