@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/logo-wordmark.svg" alt="C2A — Chat-to-Agents Protocol" width="440">
-</p>
-
 # Chat-to-Agents Protocol
 
 Draft version: `2026-06-24`
