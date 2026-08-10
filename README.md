@@ -1,6 +1,6 @@
 # Chat-to-Agents Protocol
 
-Draft version: `2026-06-24`
+Draft version: `2026-08-11`
 
 C2A routes human and agent chat into LLM agents without turning every visible
 message into a prompt every agent feels obliged to answer.
@@ -65,6 +65,10 @@ content; the agent pulls the body with a read tool only if it decides to act.
 
 When you must respond, either answer or say plainly that you can't yet (and why).
 
+An event carrying an `obligation` object is its author declaring itself blocked
+on you. Answer it or say plainly that you can't yet; a reaction does not close
+it. See *Obligations*.
+
 ## When You Must Not Respond
 
 - Ambient channel chatter not aimed at you.
@@ -77,7 +81,7 @@ An agent MUST NOT answer just because a message is visible.
 
 When you talk to other agents, be deliberate about who you obligate:
 
-- **Mention only to create an obligation.** To share context, post without a
+- **Mention only when you want a reply.** To share context, post without a
   mention so no one is forced to reply.
 - **Address one responder.** DM or @mention the single agent you want to act,
   rather than a whole channel.
@@ -102,6 +106,9 @@ Two agents can talk forever. Don't let them.
 - **Stop after a back-and-forth that isn't converging.** If an exchange between
   agents repeats without progress, end it instead of answering again. Escalate
   to a human if a decision is actually needed.
+- **Boomerang returns are exempt.** A return on an open obligation is by
+  construction a repeating exchange with a silent partner. A host MUST NOT
+  suppress it under this section.
 
 ## Reaction Signals
 
@@ -122,9 +129,35 @@ whatever glyphs the platform supports. Agents reason about signals, not glyphs.
 | `unclear` | ❓ | Needs clarification |
 
 Prefer a reaction when a signal is enough: "got it", "on it", "approved", and
-"not me" are reactions, not sentences. A reaction on an agent's **own** message
-is an inbound signal back to it: `agree` means proceed, `declined` means revise,
-`done` means already handled.
+"not me" are reactions, not sentences.
+
+A reaction is read by **who emitted it**, not by whose message it sits on. When
+another party reacts to an agent's **own** message, that is an inbound signal
+back to it: `agree` means proceed, `declined` means revise, `done` means that
+party is finished on its own side. A party's signal never states anything about
+another party's work, so a recipient's `done` MUST NOT be read as "settled for
+everyone". An author reacting to its own message is a distinct act; on an
+obligating event it is the discharge signal (*Obligations*).
+
+A reaction is an event in its own right:
+
+```json
+{
+  "reactionId": "rxn_9",
+  "targetEventId": "evt_123",
+  "createdAt": "2026-08-11T15:40:03Z",
+  "actor": { "id": "U123", "kind": "human" },
+  "signal": "done",
+  "recipient": { "id": "A456", "kind": "agent" }
+}
+```
+
+- `actor`: who emitted the signal. Required, and the input to every rule that
+  turns on who reacted.
+- `targetEventId`: the event reacted to.
+- `createdAt`: when the signal was emitted, assigned by the authoritative log.
+- `recipient`: which recipient of the target event this signal is about.
+  Required on a discharging reaction, otherwise optional.
 
 ## Event Shape
 
@@ -133,19 +166,215 @@ A delivered event carries enough to make the response decision:
 ```json
 {
   "eventId": "evt_123",
+  "createdAt": "2026-08-11T14:02:11Z",
   "conversation": { "id": "C123", "kind": "dm" },
   "author": { "id": "U123", "kind": "human", "displayName": "Will" },
+  "recipients": [{ "id": "A456", "kind": "agent", "displayName": "releaser" }],
   "addressedToMe": true,
   "policy": "must_respond",
+  "obligation": {
+    "blocks": "halted",
+    "defaultAction": "Keep the deployment paused",
+    "dischargeDelegate": { "id": "A789", "kind": "agent" }
+  },
   "content": "Can you check whether the deploy is blocked?"
 }
 ```
 
 - `conversation.kind`: `dm`, `channel`, or `thread`.
+- `createdAt`: when the event was created, assigned by the authoritative log.
+  Every obligation age derives from it.
+- `recipients`: the parties this event is addressed to, by identity. Obligations
+  key on `(eventId, recipient)`, and a per-delivery boolean is not an identity.
 - `addressedToMe`: was this aimed at this agent (DM, or resolved @mention)?
 - `policy`: the response rule above. The host sets it; `addressedToMe` is the
-  main input.
+  main input. `policy` means "you were addressed" and nothing more.
+- `obligation`: present only when the author declares itself blocked on an
+  answer. Its presence creates an obligation; see *Obligations*. It is absent
+  from most events, including most DMs and mentions.
+- `obligation.blocks`: `halted`, `degraded`, or `none` — the author's own
+  execution state while the question is unanswered. This is the author-declared
+  blocking marker, and it is why the event obligates. The queue orders by it,
+  then by age.
+- `obligation.defaultAction`: free text, what the author will do absent an
+  answer. It is read, not sorted.
+- `obligation.dischargeDelegate`: the party that may discharge on the author's
+  behalf. Set at creation; defaults to the author's coordinator.
 - `content`: the message text.
+
+## Obligations
+
+An **obligating event** is an event carrying an `obligation` object. The
+presence of that object creates the obligation. `policy` does not create one.
+
+An obligating event MUST be delivered with `policy: must_respond`. An event
+delivered `may_respond` or `must_not_respond` never creates an obligation. An
+obligating event SHOULD address exactly one responder.
+
+Obligation state is derived from `(eventId, recipient)` over the **authoritative
+log** — the event and reaction record held by the host that owns the
+conversation and assigns `eventId`. It is not a field on the event and not a
+separate record: a field has no author, and the whole rule is *who* closed it.
+Any other host's view is a cache, and where two views disagree the authoritative
+log settles it.
+
+**An obligation is discharged when the obligating author, or its named discharge
+delegate, confirms it was answered — not on read, not on the recipient's belief
+that it replied, and not on a timer.**
+
+Nothing auto-closes and nothing expires.
+
+### Who May Discharge
+
+| Party | May discharge |
+| --- | --- |
+| The obligating author | Yes. |
+| The `obligation.dischargeDelegate` named at creation | Yes. |
+| The recipient | No — except at the terminal human rung, below. |
+| Any other party | No. |
+
+The delegate defaults to the author's coordinator, so discharge authority stays
+on the asking side without depending on one process surviving. Where agents exit
+on completing a brief, the author is routinely gone before an answer arrives:
+the delegate and the human tier are **normal** closers, not narrow escape
+hatches, and the human tier is sized for that load.
+
+A discharging reaction MUST name, in `recipient`, the recipient it discharges. A
+reaction naming no recipient discharges nothing. Discharge is monotonic:
+removing a discharging reaction does not reopen a discharged obligation.
+
+### Recipient Signals
+
+A recipient may emit any signal on an obligating event. None of them discharge
+it.
+
+| Recipient signal | Effect on the obligation |
+| --- | --- |
+| `seen`, `claimed` | None. |
+| `agree` | None. It does not discharge, so a recipient who approves by reaction and stops there is still returned to. |
+| `working`, `queued` | Extend the return interval once. |
+| `done` | A claim that the recipient answered. Evidence, not a discharge. |
+| `declined`, `blocked` | Escalate at the next return, skipping the remaining returns. |
+| `unclear` | Pause the ladder and open a reciprocal obligation on the author to clarify. |
+
+The extension cap is one per `(eventId, recipient)`, counting distinct extending
+signals: `working` then `queued` is one extension, not two. Removing and
+re-adding a signal does not restore it.
+
+`unclear` pauses rather than escalates because a recipient MUST NOT be escalated
+for failing to answer a question it has formally stated it cannot parse. With
+`unclear` and `agree` specified, a recipient that answered honestly has an
+honest way to stop the returns and never needs to react `declined` falsely.
+
+### Boomerang And Escalation
+
+An open obligation returns to its recipient at a flat interval. The interval
+derives from injection mode: `immediate` shortest, `buffered` medium, `notify`
+and `tool_mailbox` longest. The ordering is normative; the numbers are not.
+
+An obligating event MUST NOT be delivered with `digest` or `silent`. An event
+that obligates a reply, delivered in a mode the model may never see as
+actionable, is incoherent.
+
+The return is a `notify` knock, not a re-injection: who, where, topic, age, and
+the author's `defaultAction`. The content stays stored and pullable. The knock
+MUST be injected. A host MUST NOT satisfy a return by writing to a store the
+model reads only on its own initiative — that is the stream the original decayed
+into.
+
+Returns do not back off. The interval stays flat for N returns, default 3.
+Backing off makes an unanswered obligation quieter over time, which is the
+failure being fixed.
+
+After N returns the host escalates: to the recipient's coordinator when it knows
+one, and to a human otherwise. There is no escalation to a conversation — a
+conversation is not a recipient, and a channel-wide obligation contradicts
+*Address one responder*. Each escalation is itself an obligating event addressed
+to one recipient, so the ladder is recursive and an escalation target that fails
+silently is caught one rung up.
+
+Escalations sharing a `(blocked-on recipient, tier)` coalesce into one
+obligation carrying the list. Discharging the coalesced obligation does not
+discharge the underlying ones.
+
+The human rung is terminal. Two things are true there, and both are stated
+rather than pretended away:
+
+- The recipient and the permitted closer are the same party. This is the one
+  exception to author-side discharge.
+- The terminal rung does not boomerang. Returns stop, and the obligation stays
+  open and visible in the open set until a human discharges it. This is not
+  expiry — nothing but a discharge closes it.
+
+### Replay, Reordering, And Retention
+
+- Age is `now − createdAt`, taken from the event. A host MUST NOT re-derive age
+  from local receipt time; an obligation that gets younger on every restart
+  never escalates.
+- On resuming after a gap, a host computes the current tier from `createdAt` and
+  returns once at the next interval. It MUST NOT emit the returns it missed.
+- A reaction naming an unknown `targetEventId` MUST be held until that event
+  arrives rather than dropped. Dropping it discards a closer and leaves an
+  obligation nobody can close.
+- An edit event inherits the obligation of the event it edits. It does not open
+  a second obligation on the same question.
+- Deletion by the author discharges the obligation. Deletion by any other party,
+  and removal by retention, do not.
+- Retention floor: the authoritative log MUST retain an obligating event and its
+  reactions for at least as long as the obligation is open. A compaction window
+  shorter than that silently discharges everything older than it.
+
+### The Open Set
+
+Two queries, one call each, both derived from the log:
+
+| Query | Result |
+| --- | --- |
+| What I owe | Obligations open with me as recipient. |
+| What I am blocking | Obligations open with me as author or delegate. |
+
+The second is the one that does not exist today. The open set has to beat a
+hand-maintained state file, or it will not be used.
+
+### Rationale
+
+An agent asked its coordinator one gate question and sat blocked for nearly
+three hours. Nothing failed loudly. The question was delivered and read, no
+answer came, and the answered and unanswered states were byte-identical to every
+observer.
+
+This defect class recurs: a spawn reporting success while launching nothing, a
+heartbeat written by a timer rather than by progress, a status field reporting
+healthy over a dead queue. In every case a well-formed signal stood in for a
+fact nobody verified. The fix is the same in kind each time — make the state
+explicit, put the confirming signal in the hands of the party who can verify it,
+and make its absence loud. That is why discharge is author-side, why returns do
+not back off, and why the ladder ends at a human.
+
+### Conformance
+
+A conformant host MUST demonstrate all four arms below on one fixture: one
+obligating event, one recipient, every message driven through the **production
+send path** rather than a test-only constructor. Each assertion is on whether
+**the recipient model took a turn**, not on whether an event was emitted.
+
+| Arm | Setup | Required behaviour |
+| --- | --- | --- |
+| A | Delivered and read; recipient posts a reply that does not answer; recipient reacts `done`; recipient reacts `seen` | The obligation MUST still return, and the return MUST take a model turn at the recipient |
+| B | The obligating author, or its discharge delegate, reacts `done` naming the recipient | It MUST NOT return again |
+| C | No signals at all | Returns at t, 2t, and 3t at equal intervals, followed by an escalation observed at a different recipient |
+| D | Arm A run twice, once with recipient read state set and once unset | Byte-identical behaviour across both runs |
+
+A and B are a pair. A alone is satisfied by a host that never discharges; B
+alone is satisfied by a host that does nothing at all.
+
+**Control.** Run the same suite with boomerang disabled and confirm arms A and C
+**fail**. A suite that stays green with the mechanism removed is passing
+vacuously.
+
+Read state MUST NOT be an input to discharge. A host that closes an obligation
+on read, on reply, on any recipient-emitted signal, or on elapsed time is
+non-conformant.
 
 ## Edits, Deletes, And Fragments
 
