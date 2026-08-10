@@ -254,7 +254,7 @@ it.
 | `agree` | None. It does not discharge, so a recipient who approves by reaction and stops there is still returned to. |
 | `working`, `queued` | Extend the return interval once. |
 | `done` | A claim that the recipient answered. Evidence, not a discharge. |
-| `declined`, `blocked` | Escalate at the next return, skipping the remaining returns. |
+| `declined`, `blocked` | Escalate immediately, without waiting for the next return. |
 | `unclear` | Pause the ladder and open a reciprocal obligation on the author to clarify. |
 
 The extension cap is one per `(eventId, recipient)`, counting distinct extending
@@ -265,6 +265,13 @@ re-adding a signal does not restore it.
 for failing to answer a question it has formally stated it cannot parse. With
 `unclear` and `agree` specified, a recipient that answered honestly has an
 honest way to stop the returns and never needs to react `declined` falsely.
+
+A pause is not a close, and it is bounded from the other side. The ladder
+resumes at the next interval when the author emits a clarifying edit or a new
+obligating event on the same question, and the reciprocal obligation runs its
+own ladder against the author meanwhile. So an author that never clarifies is
+escalated for that silence, and `unclear` cannot be used to mute an obligation
+indefinitely. A paused obligation stays open and stays in the open set.
 
 ### Boomerang And Escalation
 
